@@ -315,13 +315,23 @@ export class Game {
     this.wall += dt;
     const target = this.practiceTarget(t);
     const ref = target >= 0 ? this.notes[target].midi : (this.low + this.high) / 2;
+    const { octaveStrict } = getSettings();
     this.players.forEach((p) => {
       if (!p.mic) return;
       const midi = p.mic.read();
-      const shown = midi === null ? null : midi + 12 * Math.round((ref - midi) / 12);
+      // в точном режиме кругляшок стоит на настоящей высоте голоса: видно, дотягиваешь ли октаву
+      const shown = midi === null ? null
+        : octaveStrict ? midi
+        : midi + 12 * Math.round((ref - midi) / 12);
       this.smoothPitch(p, shown, this.wall, dt);
       if (midi !== null) {
-        p.hint = { name: noteName(midi), diff: target >= 0 ? pitchClassDiff(this.notes[target].midi, midi) : NaN };
+        // при строгой октаве подсказка показывает и разницу на октаву: «Ля4 ↑ 12» — пойте октавой ниже
+        const diff = target >= 0
+          ? (!octaveStrict || Math.abs(midi - this.notes[target].midi) < 6
+            ? pitchClassDiff(this.notes[target].midi, midi)
+            : midi > this.notes[target].midi ? 12 : -12)
+          : NaN;
+        p.hint = { name: noteName(midi), diff };
       } else if (p.glow < 0.05) {
         p.hint = null;
       }
@@ -337,7 +347,7 @@ export class Game {
     }
     const dt = this.lastTime === null ? 0 : Math.min(0.25, Math.max(0, t - this.lastTime));
     this.lastTime = t;
-    const { tolerance, micDelay } = getSettings();
+    const { tolerance, micDelay, octaveStrict } = getSettings();
 
     const sungUntil = t - micDelay;
     const inNote = dt > 0 && this.noteAt(sungUntil) >= 0;
@@ -351,8 +361,12 @@ export class Game {
       let ok = false;
       if (midi !== null) {
         const ref = this.referenceMidi(sung);
-        shown = midi + 12 * Math.round((ref - midi) / 12);
-        ok = index >= 0 && Math.abs(pitchClassDiff(midi, this.notes[index].midi)) <= tolerance;
+        // та же честная высота, что у кругляшка на паузе: октава не складывается
+        shown = octaveStrict ? midi : midi + 12 * Math.round((ref - midi) / 12);
+        ok = index >= 0
+          && Math.abs(pitchClassDiff(midi, this.notes[index].midi)) <= tolerance
+          // уровень «Точная»: голос должен звучать в той же октаве, что и нота оригинала
+          && (!octaveStrict || Math.abs(midi - this.notes[index].midi) < 6);
       }
       this.smoothPitch(p, shown, sung, dt);
       const held = p.midi !== null && sung - p.voicedAt <= PITCH_HOLD;

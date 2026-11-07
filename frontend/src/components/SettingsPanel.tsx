@@ -177,13 +177,14 @@ export function SettingsPanel({ open, onClose, playback }: { open: boolean; onCl
       <Section icon={<Gamepad2 size={14} />} title="Игра">
         <Select
           label="Сложность"
-          value={s.tolerance}
+          value={s.octaveStrict ? 0.4 : s.tolerance}
           options={[
             { value: 1.5, label: 'Лёгкая (±1,5 полутона)' },
             { value: 1, label: 'Обычная (±1 полутон)' },
             { value: 0.5, label: 'Сложная (±0,5 полутона)' },
+            { value: 0.4, label: 'Точная (±0,5, октава как в оригинале)' },
           ]}
-          onChange={(tolerance) => s.set({ tolerance })}
+          onChange={(v) => (v === 0.4 ? s.set({ tolerance: 0.5, octaveStrict: true }) : s.set({ tolerance: v, octaveStrict: false }))}
         />
       </Section>
     </Drawer>

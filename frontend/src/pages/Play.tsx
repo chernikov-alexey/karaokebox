@@ -1,13 +1,16 @@
 // Экран песни: подготовка (тональность, микрофоны), игра поверх клипа и результаты.
 import {
-  ChevronLeft, LoaderCircle, Maximize, Mic, Minus, Pause, Play as PlayIcon, Plus, RotateCcw, RotateCw, SlidersHorizontal, Square,
+  ChevronLeft, Expand, Headphones, LoaderCircle, Maximize, Mic, Minus, Music2, PanelBottomClose, PanelBottomOpen, Pause,
+  Play as PlayIcon, Plus, RotateCcw, RotateCw, SlidersHorizontal, Square, ZoomIn, ZoomOut,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { api, songLabel, stemUrl, videoUrl, type Song } from '../api';
 import { engine, loadBuffer, useDevices } from '../audio/engine';
 import { MicToggle, toggleMics } from '../components/MicToggle';
 import { MicMeter, SettingsPanel } from '../components/SettingsPanel';
 import { Button, IconButton, cx, toastError } from '../components/ui';
+import { computePeaks } from '../editor/player';
+import { Timeline, clampView, type View } from '../editor/Timeline';
 import { Game, PLAYER_COLORS, type PlayerResult } from '../game/game';
 import { clock, semitones } from '../lib/format';
 import { navigate } from '../router';
@@ -19,6 +22,7 @@ interface Buffers {
   key: number;
   minus: AudioBuffer;
   vocals: AudioBuffer;
+  peaks: Float32Array;
 }
 
 const toggleFullscreen = () => {
@@ -34,16 +38,21 @@ export function Play({ id }: { id: string }) {
   const [results, setResults] = useState<PlayerResult[] | null>(null);
   const [settings, setSettings] = useState(false);
   const [chrome, setChrome] = useState(true);
+  const [timelineVisible, setTimelineVisible] = useState(true);
+  const [panelH, setPanelH] = useState(0); // высота блока таймлайна: сцена не должна оказаться под ним
   const [clockText, setClockText] = useState('0:00');
   const [position, setPosition] = useState(0);
+  const [view, setView] = useState<View>({ start: 0, pps: 80 });
   const [osd, setOsd] = useState<{ text: string; id: number } | null>(null);
   const key = useSettings((s) => s.keys[id] ?? 0);
   const setKey = useSettings((s) => s.setKey);
+  const st = useSettings();
   const devices = useDevices();
 
   const canvas = useRef<HTMLCanvasElement>(null);
   const video = useRef<HTMLVideoElement>(null);
   const game = useRef<Game | null>(null);
+  const strip = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     api.song(id).then((s) => {
@@ -62,7 +71,7 @@ export function Play({ id }: { id: string }) {
     setPhase((p) => (p === 'lobby' ? 'loading' : p));
     Promise.all([loadBuffer(stemUrl(id, 'minus', key), abort.signal), loadBuffer(stemUrl(id, 'vocals', key), abort.signal)])
       .then(([minus, vocals]) => {
-        setBuffers({ key, minus, vocals });
+        setBuffers({ key, minus, vocals, peaks: computePeaks(vocals) });
         setPhase((p) => (p === 'loading' ? 'lobby' : p));
         // тональность сменили прямо во время песни
         if (game.current && game.current.key !== key) game.current.setTrack(minus, vocals, key);
@@ -100,6 +109,27 @@ export function Play({ id }: { id: string }) {
     setPaused(g.paused);
   }, []);
 
+  const noAction = useCallback(() => {}, []);
+
+  // следим за высотой блока таймлайна, чтобы поднять сцену над ним
+  useEffect(() => {
+    const el = strip.current;
+    if (!el || phase !== 'playing' || !song || !buffers) return;
+    setPanelH(el.clientHeight);
+    const observer = new ResizeObserver(() => setPanelH(el.clientHeight));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [phase, song, buffers]);
+  // таймлайну нужно только время и флаг игры — читаем напрямую из Game на каждый кадр
+  const playTime = useMemo(
+    () => ({
+      get time() { return game.current?.time ?? 0; },
+      get playing() { return game.current !== null && !game.current.paused; },
+    }),
+    [],
+  );
+  const timelineLines = useMemo(() => (song ? song.lyrics.map((l, i) => ({ ...l, id: i })) : []), [song]);
+
   const seekTo = useCallback((t: number, label?: string) => {
     const g = game.current;
     if (!g) return;
@@ -114,6 +144,24 @@ export function Play({ id }: { id: string }) {
     const t = Math.max(0, Math.min(g.duration - 0.5, g.time + dt));
     seekTo(t, `${dt < 0 ? '⏪' : '⏩'} ${clock(t)}`);
   }, [seekTo]);
+
+  // масштаб таймлайна вокруг курсора; как в редакторе: + / −
+  const zoom = useCallback((factor: number) => {
+    const W = strip.current?.clientWidth ?? 800;
+    setView((v) => {
+      const g = game.current;
+      const t = g?.time ?? 0;
+      const center = g && !g.paused && !g.finished ? t
+        : t >= v.start && t <= v.start + W / v.pps ? t : v.start + (W / v.pps) / 2;
+      const pps = v.pps * factor;
+      return clampView({ pps, start: center - (center - v.start) * (v.pps / pps) }, buffers?.minus.duration ?? 1, W);
+    });
+  }, [buffers]);
+
+  const showEntire = useCallback(() => {
+    if (!buffers) return;
+    setView(clampView({ start: 0, pps: 0 }, buffers.minus.duration, strip.current?.clientWidth ?? 800));
+  }, [buffers]);
 
   useEffect(() => {
     if (!osd) return;
@@ -185,6 +233,16 @@ export function Play({ id }: { id: string }) {
         seekBy((e.code === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 15 : 5));
         return;
       }
+      if (phase === 'playing' && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
+        e.preventDefault();
+        zoom(1.5);
+        return;
+      }
+      if (phase === 'playing' && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
+        e.preventDefault();
+        zoom(1 / 1.5);
+        return;
+      }
       if (target.matches('input') && e.code !== 'Space') return;
       if (e.code === 'KeyF') toggleFullscreen();
       else if (e.code === 'KeyM') void toggleMics();
@@ -196,7 +254,7 @@ export function Play({ id }: { id: string }) {
     };
     addEventListener('keydown', onKey);
     return () => removeEventListener('keydown', onKey);
-  }, [phase, start, togglePause, seekBy]);
+  }, [phase, start, togglePause, seekBy, zoom]);
 
   const clip = song && videoUrl(song);
 
@@ -211,11 +269,15 @@ export function Play({ id }: { id: string }) {
           <div className="absolute left-1/3 top-1/2 size-[40vmax] rounded-full bg-cyan-500/15 blur-[120px] [animation:aurora_36s_linear_infinite]" />
         </div>
       )}
-      {/* с открытой панелью сцена ужимается, чтобы текст и ноты не прятались под ней */}
+      {/* с открытой панелью сцена ужимается, чтобы текст и ноты не прятались под ней;
+          то же с таймлайном — текст выше него */}
       <canvas
         ref={canvas}
         className={cx('absolute inset-y-0 left-0 h-full', phase !== 'playing' && 'hidden')}
-        style={{ width: settings ? 'calc(100% - min(24rem, 100%))' : '100%' }}
+        style={{
+          width: settings ? 'calc(100% - min(24rem, 100%))' : '100%',
+          height: phase === 'playing' && timelineVisible && panelH ? `calc(100% - ${panelH}px)` : '100%',
+        }}
       />
 
       {/* верхняя панель */}
@@ -231,6 +293,9 @@ export function Play({ id }: { id: string }) {
         <div className="ml-auto flex items-center gap-1">
           {phase === 'playing' && (
             <>
+              <IconButton label={timelineVisible ? 'Скрыть таймлайн' : 'Показать таймлайн'} onClick={() => setTimelineVisible(!timelineVisible)}>
+                {timelineVisible ? <PanelBottomClose size={17} /> : <PanelBottomOpen size={17} />}
+              </IconButton>
               <span className="mr-2 text-sm tabular-nums text-white/60">{clockText}</span>
               {key !== 0 && <span className="mr-2 rounded-full bg-white/10 px-2 py-1 text-xs">Тон {semitones(key)}</span>}
               <IconButton label="Назад 5 с (←)" onClick={() => seekBy(-5)}><RotateCcw size={17} /></IconButton>
@@ -268,7 +333,7 @@ export function Play({ id }: { id: string }) {
 
       {/* пауза не закрывает экран: музыка стоит, а микрофон работает — можно примериться к нотам */}
       {phase === 'playing' && paused && (
-        <div className="pointer-events-none absolute bottom-8 left-0 z-20 flex justify-center px-4" style={{ right: settings ? 'min(24rem, 100%)' : 0 }}>
+        <div className="pointer-events-none absolute left-0 z-20 flex justify-center px-4" style={{ right: settings ? 'min(24rem, 100%)' : 0, bottom: panelH ? panelH + 8 : 208 }}>
           <div className="pointer-events-auto flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-panel/85 p-2 pl-4 shadow-2xl backdrop-blur-xl">
             <div className="mr-2">
               <p className="flex items-center gap-2 text-sm font-bold"><Pause size={14} />Пауза</p>
@@ -279,6 +344,51 @@ export function Play({ id }: { id: string }) {
             <IconButton label="Сначала" onClick={() => { game.current?.stop(); void start(); }}><RotateCcw size={17} /></IconButton>
             <IconButton label="Закончить и узнать оценку" onClick={() => game.current?.finish()}><Square size={15} /></IconButton>
           </div>
+        </div>
+      )}
+
+      {/* таймлайн как в редакторе: перейти в любое место песни; снизу — громкости и масштаб */}
+      {phase === 'playing' && song && buffers && (
+        <div
+          ref={strip}
+          className={cx(
+            'absolute bottom-0 left-0 z-10 transition-opacity duration-300',
+            timelineVisible ? 'opacity-100' : 'pointer-events-none opacity-0',
+          )}
+          style={{ right: settings ? 'min(24rem, 100%)' : 0 }}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-white/10 bg-panel/85 px-4 py-1.5 backdrop-blur-xl">
+            <div className="flex items-center gap-1">
+              <IconButton label="Уменьшить (−)" size="sm" onClick={() => zoom(1 / 1.5)}><ZoomOut size={16} /></IconButton>
+              <IconButton label="Увеличить (+)" size="sm" onClick={() => zoom(1.5)}><ZoomIn size={16} /></IconButton>
+              <IconButton label="Вся песня" size="sm" onClick={showEntire}><Expand size={16} /></IconButton>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
+              <QuickVolume icon={<Music2 size={15} />} label="Минус" max={1.5} value={st.music} onChange={(music) => st.set({ music })} />
+              <QuickVolume icon={<Headphones size={15} />} label="Голос исполнителя" max={1} value={st.guide} onChange={(guide) => st.set({ guide })} />
+              <QuickVolume icon={<Mic size={15} />} label="Громкость микрофона" max={2} value={st.micVolume}
+                onChange={(micVolume) => st.set({ micVolume, monitor: true })} />
+            </div>
+          </div>
+          <Timeline
+            readonly
+            height={184}
+            duration={buffers.minus.duration}
+            peaks={buffers.peaks}
+            notes={song.noteList}
+            lines={timelineLines}
+            selection={null}
+            region={null}
+            view={view}
+            player={playTime}
+            follow
+            onView={setView}
+            onSeek={seekTo}
+            onRegion={noAction}
+            onSelect={noAction}
+            onDrag={noAction}
+            onOpen={noAction}
+          />
         </div>
       )}
 
@@ -385,6 +495,32 @@ function Lobby({ song, loading, keyShift, onKey, micActive, micError, onStart }:
         <p className="mt-3 text-center text-xs text-white/35">Пробел — пауза · F — на весь экран</p>
       </div>
     </Centered>
+  );
+}
+
+// Компактный ползунок громкости над таймлайном.
+function QuickVolume({ icon, label, max, value, onChange }: {
+  icon: ReactNode;
+  label: string;
+  max: number;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <label className="flex items-center gap-2 text-xs text-white/60" title={label}>
+      {icon}
+      <span className="hidden xl:inline">{label}</span>
+      <input
+        type="range"
+        className="w-25"
+        min={0}
+        max={max}
+        step={0.01}
+        value={value}
+        style={{ '--fill': `${(value / max) * 100}%` } as CSSProperties}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+    </label>
   );
 }
 

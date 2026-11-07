@@ -5,7 +5,14 @@ import { useEffect, useRef, type MouseEvent as ReactMouseEvent, type PointerEven
 import type { Note } from '../api';
 import { fitLine, lineText, retimeLine } from '../lib/lyrics';
 import type { ELine, Region, Selection } from './model';
-import { PEAKS_PER_SEC, type EditorPlayer } from './player';
+import { PEAKS_PER_SEC } from './player';
+
+// Проигрыватель, которого достаточно таймлайну: время и флаг игры.
+// EditorPlayer и адаптер Game в режиме пения оба ему удовлетворяют.
+export interface PlayerLike {
+  time: number;
+  playing: boolean;
+}
 
 export interface View {
   start: number;
@@ -24,6 +31,7 @@ const FONT = '"Manrope Variable", system-ui, sans-serif';
 type Drag =
   | { kind: 'region'; anchor: number; x0: number; moved: boolean }
   | { kind: 'region-edge'; other: number }
+  | { kind: 'browse'; x0: number; moved: boolean }
   | { kind: 'line-move' | 'line-start' | 'line-end'; orig: ELine; t0: number; x0: number; moved: boolean }
   | { kind: 'word-move' | 'word-start' | 'word-end'; orig: ELine; index: number; t0: number; x0: number; moved: boolean };
 
@@ -35,7 +43,7 @@ export interface TimelineProps {
   selection: Selection;
   region: Region | null;
   view: View;
-  player: EditorPlayer;
+  player: PlayerLike;
   follow: boolean;
   onView: (v: View) => void;
   onSeek: (t: number) => void;
@@ -43,6 +51,10 @@ export interface TimelineProps {
   onSelect: (s: Selection) => void;
   onDrag: (phase: 'start' | 'move' | 'end', lines?: ELine[]) => void;
   onOpen: (id: number) => void;
+  /** высота таймлайна, по умолчанию как в редакторе */
+  height?: number;
+  /** только просмотр: клик — перейти, протянуть — прокрутить; без выделения, правок и разметки */
+  readonly?: boolean;
 }
 
 export function clampView(v: View, duration: number, width: number): View {
@@ -119,10 +131,12 @@ export function Timeline(props: TimelineProps) {
     if (!c) return;
     const p = live.current;
     const W = c.clientWidth;
+    const H = p.height ?? TIMELINE_H;
+    const waveH = Math.max(24, H - WAVE.y);
     const dpr = Math.min(2, devicePixelRatio || 1);
-    if (c.width !== Math.round(W * dpr) || c.height !== Math.round(TIMELINE_H * dpr)) {
+    if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) {
       c.width = Math.round(W * dpr);
-      c.height = Math.round(TIMELINE_H * dpr);
+      c.height = Math.round(H * dpr);
     }
     const g = c.getContext('2d')!;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -138,10 +152,10 @@ export function Timeline(props: TimelineProps) {
     const tEnd = view.start + W / view.pps;
 
     g.fillStyle = '#0e0c18';
-    g.fillRect(0, 0, W, TIMELINE_H);
+    g.fillRect(0, 0, W, H);
     g.fillStyle = 'rgba(255,255,255,0.025)';
     g.fillRect(0, LINES.y, W, LINES.h);
-    g.fillRect(0, WAVE.y, W, WAVE.h);
+    g.fillRect(0, WAVE.y, W, waveH);
 
     // линейка
     const step = tickStep(view.pps);
@@ -153,7 +167,7 @@ export function Timeline(props: TimelineProps) {
       g.fillStyle = 'rgba(255,255,255,0.12)';
       g.fillRect(x, 0, 1, RULER_H);
       g.fillStyle = 'rgba(255,255,255,0.04)';
-      g.fillRect(x, RULER_H, 1, TIMELINE_H - RULER_H);
+      g.fillRect(x, RULER_H, 1, H - RULER_H);
       g.fillStyle = 'rgba(255,255,255,0.5)';
       g.fillText(label(t, step < 1), x + 4, RULER_H / 2);
       for (let k = 1; k < 5; k++) {
@@ -166,7 +180,7 @@ export function Timeline(props: TimelineProps) {
 
     // волна голоса: фиолетовая там, где есть текст, серая — где голос без текста
     const lines = p.lines;
-    const mid = WAVE.y + WAVE.h / 2;
+    const mid = WAVE.y + waveH / 2;
     let li = 0;
     for (let x = 0; x < W; x++) {
       const t0 = view.start + x / view.pps;
@@ -178,7 +192,7 @@ export function Timeline(props: TimelineProps) {
       for (let i = i0; i < i1 && i < p.peaks.length; i++) if (p.peaks[i] > peak) peak = p.peaks[i];
       while (li < lines.length && lines[li].end < t0) li++;
       const covered = li < lines.length && lines[li].start <= t0;
-      const h = Math.max(0.5, peak ** 0.75 * (WAVE.h / 2 - 6));
+      const h = Math.max(0.5, peak ** 0.75 * (waveH / 2 - 6));
       g.fillStyle = covered ? 'rgba(167,139,250,0.75)' : 'rgba(255,255,255,0.28)';
       g.fillRect(x, mid - h, 1, h * 2);
     }
@@ -191,7 +205,7 @@ export function Timeline(props: TimelineProps) {
       g.fillStyle = 'rgba(244,114,182,0.75)';
       for (const n of p.notes) {
         if (n.end < view.start || n.start > tEnd) continue;
-        const y = WAVE.y + 6 + (1 - (n.midi - lo) / (hi - lo)) * (WAVE.h - 12);
+        const y = WAVE.y + 6 + (1 - (n.midi - lo) / (hi - lo)) * (waveH - 12);
         g.beginPath();
         g.roundRect(X(n.start), y - 1.5, Math.max(2, (n.end - n.start) * view.pps), 3, 1.5);
         g.fill();
@@ -238,10 +252,10 @@ export function Timeline(props: TimelineProps) {
       const rx = X(r.start);
       const rw = (r.end - r.start) * view.pps;
       g.fillStyle = 'rgba(250,204,21,0.1)';
-      g.fillRect(rx, RULER_H, rw, TIMELINE_H - RULER_H);
+      g.fillRect(rx, RULER_H, rw, H - RULER_H);
       g.fillStyle = 'rgba(250,204,21,0.9)';
-      g.fillRect(rx - 1, RULER_H, 2, TIMELINE_H - RULER_H);
-      g.fillRect(rx + rw - 1, RULER_H, 2, TIMELINE_H - RULER_H);
+      g.fillRect(rx - 1, RULER_H, 2, H - RULER_H);
+      g.fillRect(rx + rw - 1, RULER_H, 2, H - RULER_H);
       g.fillStyle = 'rgba(250,204,21,0.35)';
       g.fillRect(rx, 0, rw, RULER_H);
     }
@@ -250,7 +264,7 @@ export function Timeline(props: TimelineProps) {
     const px = X(now);
     if (px >= -10 && px <= W + 10) {
       g.fillStyle = '#facc15';
-      g.fillRect(Math.round(px) - 1, 0, 2, TIMELINE_H);
+      g.fillRect(Math.round(px) - 1, 0, 2, H);
       g.beginPath();
       g.moveTo(px - 6, 0);
       g.lineTo(px + 6, 0);
@@ -335,12 +349,17 @@ export function Timeline(props: TimelineProps) {
 
   const onPointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    if (live.current.readonly) {
+      // как в редакторе: протянуть — прокрутить, клик — перейти
+      drag.current = { kind: 'browse', x0: e.nativeEvent.offsetX, moved: false };
+      return;
+    }
     const p = live.current;
     const x = e.nativeEvent.offsetX;
     const y = e.nativeEvent.offsetY;
     const t = timeAt(x);
     const hit = hitTest(x, y);
-    e.currentTarget.setPointerCapture(e.pointerId);
     if (hit.kind === 'region-edge') {
       drag.current = { kind: 'region-edge', other: hit.other };
     } else if (hit.kind === 'line') {
@@ -358,10 +377,18 @@ export function Timeline(props: TimelineProps) {
     const x = e.nativeEvent.offsetX;
     const d = drag.current;
     if (!d) {
-      e.currentTarget.style.cursor = cursorFor(hitTest(x, e.nativeEvent.offsetY));
+      e.currentTarget.style.cursor = live.current.readonly ? 'default' : cursorFor(hitTest(x, e.nativeEvent.offsetY));
       return;
     }
     const p = live.current;
+    if (d.kind === 'browse') {
+      const dx = x - d.x0;
+      if (!d.moved && Math.abs(dx) < 4) return;
+      d.moved = true;
+      d.x0 = x;
+      p.onView(clampView({ ...p.view, start: p.view.start - dx / p.view.pps }, p.duration, width.current));
+      return;
+    }
     const t = timeAt(x);
     if (d.kind === 'region') {
       if (!d.moved && Math.abs(x - d.x0) < 4) return;
@@ -388,6 +415,11 @@ export function Timeline(props: TimelineProps) {
     if (!d) return;
     const p = live.current;
     const t = timeAt(e.nativeEvent.offsetX);
+    if (d.kind === 'browse') {
+      // клик без протяжки — перейти в место
+      if (!d.moved) p.onSeek(t);
+      return;
+    }
     if (d.kind === 'region') {
       if (!d.moved) {
         p.onSeek(t);
@@ -405,6 +437,7 @@ export function Timeline(props: TimelineProps) {
   };
 
   const onDoubleClick = (e: ReactMouseEvent<HTMLCanvasElement>) => {
+    if (live.current.readonly) return;
     const hit = hitTest(e.nativeEvent.offsetX, e.nativeEvent.offsetY);
     if (hit.kind === 'line' || hit.kind === 'word') live.current.onOpen(hit.line.id);
   };
@@ -413,7 +446,7 @@ export function Timeline(props: TimelineProps) {
     <canvas
       ref={canvas}
       className="block w-full touch-none select-none"
-      style={{ height: TIMELINE_H }}
+      style={{ height: props.height ?? TIMELINE_H }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -424,7 +457,7 @@ export function Timeline(props: TimelineProps) {
 }
 
 // Новое положение строки или слова при перетаскивании.
-function moveBlock(d: Exclude<Drag, { kind: 'region' | 'region-edge' }>, t: number, duration: number): ELine {
+function moveBlock(d: Exclude<Drag, { kind: 'region' | 'region-edge' | 'browse' }>, t: number, duration: number): ELine {
   const dt = t - d.t0;
   const line = d.orig;
   if (d.kind === 'line-move') {

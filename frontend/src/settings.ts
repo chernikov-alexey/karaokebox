@@ -9,6 +9,8 @@ export interface Settings {
   micOn: boolean;
   aec: boolean;
   tolerance: number;
+  // зачёт только в октаву ноты из оригинала (уровень «Точная»); по умолчанию октава не важна
+  octaveStrict: boolean;
   micDelay: number;
   output: string;
   master: number;
@@ -32,6 +34,7 @@ export const DEFAULTS: Settings = {
   micOn: true,
   aec: false,
   tolerance: 1,
+  octaveStrict: false,
   micDelay: 0.08,
   output: '',
   master: 0.9,
